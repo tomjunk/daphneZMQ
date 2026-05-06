@@ -11,8 +11,8 @@
 # Tunables:
 #   TARGET_SCLK_HZ=800000 \
 #   SCLK_HIGH_DELAY_NS=350 \
-#   DOUT_SAMPLE_DELAY_NS=250 \
-#   SCLK_LOW_TAIL_DELAY_NS=150 \
+#   SCLK_LOW_DELAY_NS=350 \
+#   DOUT_SAMPLE_DELAY_NS=150 \
 #   sudo -E sh scripts/apply_mezz0_adc1283_gpio_overlay.sh apply
 
 set -eu
@@ -141,7 +141,7 @@ write_dts() {
                 daphne,cs-setup-delay-ns = <${CS_SETUP_DELAY_NS}>;
                 daphne,cs-hold-delay-ns = <${CS_HOLD_DELAY_NS}>;
                 daphne,dout-sample-delay-ns = <${DOUT_SAMPLE_DELAY_NS}>;
-                daphne,sclk-low-tail-delay-ns = <${SCLK_LOW_TAIL_DELAY_NS}>;
+                daphne,sclk-low-delay-ns = <${SCLK_LOW_DELAY_NS}>;
                 daphne,sclk-high-delay-ns = <${SCLK_HIGH_DELAY_NS}>;
 
                 daphne,disable-preempt;
