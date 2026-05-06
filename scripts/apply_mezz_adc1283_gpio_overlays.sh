@@ -9,6 +9,7 @@
 #   sudo sh scripts/apply_mezz_adc1283_gpio_overlays.sh remove mezz0
 #   sudo sh scripts/apply_mezz_adc1283_gpio_overlays.sh remove all
 #   sudo sh scripts/apply_mezz_adc1283_gpio_overlays.sh status
+#   sudo sh scripts/apply_mezz_adc1283_gpio_overlays.sh status all
 #
 # Accepted mezz names:
 #   mezz0 mezz1 mezz2 mezz3 mezz4 all
@@ -26,7 +27,7 @@
 set -eu
 
 ACTION="${1:-apply}"
-if [ $# -gt 0 ]; then
+if [ "$#" -gt 0 ]; then
     shift
 fi
 
@@ -63,6 +64,7 @@ daphne_mezz_spigpio
 daphne_mezz0_custom_spigpio
 daphne_mezz0_adc1283_gpio
 daphne_mezz_adc1283_gpio
+daphne_mezz0_custom_spigpio
 "
 
 require_root() {
@@ -139,6 +141,10 @@ mezz_overlay_dir() {
     echo "${OVERLAY_ROOT}/$(mezz_overlay_name "$1")"
 }
 
+adc_node_name() {
+    echo "adc1283_${1}"
+}
+
 check_conflicting_overlays() {
     for name in ${KNOWN_CONFLICTING_OVERLAYS}; do
         if [ -d "${OVERLAY_ROOT}/${name}" ]; then
@@ -159,35 +165,35 @@ set_mezz_params() {
             SCLK_GPIO=39
             DOUT_GPIO=40
             DIN_GPIO=50
-            GROUPS='"gpio0_38_grp", "gpio0_39_grp", "gpio0_40_grp", "gpio0_50_grp"'
+            PINCTRL_GROUPS='"gpio0_38_grp", "gpio0_39_grp", "gpio0_40_grp", "gpio0_50_grp"'
             ;;
         mezz1)
             CS_GPIO=41
             SCLK_GPIO=42
             DOUT_GPIO=43
             DIN_GPIO=61
-            GROUPS='"gpio0_41_grp", "gpio0_42_grp", "gpio0_43_grp", "gpio0_61_grp"'
+            PINCTRL_GROUPS='"gpio0_41_grp", "gpio0_42_grp", "gpio0_43_grp", "gpio0_61_grp"'
             ;;
         mezz2)
             CS_GPIO=62
             SCLK_GPIO=63
             DOUT_GPIO=73
             DIN_GPIO=74
-            GROUPS='"gpio0_62_grp", "gpio0_63_grp", "gpio0_73_grp", "gpio0_74_grp"'
+            PINCTRL_GROUPS='"gpio0_62_grp", "gpio0_63_grp", "gpio0_73_grp", "gpio0_74_grp"'
             ;;
         mezz3)
             CS_GPIO=69
             SCLK_GPIO=68
             DOUT_GPIO=67
             DIN_GPIO=57
-            GROUPS='"gpio0_69_grp", "gpio0_68_grp", "gpio0_67_grp", "gpio0_57_grp"'
+            PINCTRL_GROUPS='"gpio0_69_grp", "gpio0_68_grp", "gpio0_67_grp", "gpio0_57_grp"'
             ;;
         mezz4)
             CS_GPIO=65
             SCLK_GPIO=64
             DOUT_GPIO=46
             DIN_GPIO=45
-            GROUPS='"gpio0_65_grp", "gpio0_64_grp", "gpio0_46_grp", "gpio0_45_grp"'
+            PINCTRL_GROUPS='"gpio0_65_grp", "gpio0_64_grp", "gpio0_46_grp", "gpio0_45_grp"'
             ;;
         *)
             echo "error: internal invalid mezz '${MEZZ}'" >&2
@@ -197,7 +203,7 @@ set_mezz_params() {
 
     PIN_LABEL="${MEZZ}_adc1283_pins"
     PIN_NODE="${MEZZ}-adc1283-pins"
-    ADC_NODE="adc1283_${MEZZ}"
+    ADC_NODE="$(adc_node_name "${MEZZ}")"
 }
 
 write_base_dts() {
@@ -251,6 +257,7 @@ apply_base_overlay() {
 
     write_base_dts
     dtc -@ -I dts -O dtb -o "${BASE_DTBO}" "${BASE_DTS}"
+    strip_overlay_symbols "${BASE_DTBO}"
 
     mkdir "${BASE_OVERLAY_DIR}"
     if ! cat "${BASE_DTBO}" >"${BASE_OVERLAY_DIR}/dtbo"; then
@@ -278,7 +285,7 @@ write_mezz_dts() {
         __overlay__ {
             ${PIN_LABEL}: ${PIN_NODE} {
                 mux {
-                    groups = ${GROUPS};
+                    groups = ${PINCTRL_GROUPS};
                     function = "gpio0";
                 };
             };
@@ -323,20 +330,96 @@ write_mezz_dts() {
 EOF
 }
 
+platform_device_exists() {
+    [ -e "/sys/bus/platform/devices/$1" ]
+}
+
+platform_device_bound() {
+    [ -e "/sys/bus/platform/drivers/adc1283-gpio/$1" ]
+}
+
+bind_platform_device_if_needed() {
+    ADC_NODE="$1"
+
+    if platform_device_bound "${ADC_NODE}"; then
+        return 0
+    fi
+
+    if platform_device_exists "${ADC_NODE}"; then
+        echo "${ADC_NODE}: platform device exists but is not bound; trying bind"
+        echo "${ADC_NODE}" > /sys/bus/platform/drivers/adc1283-gpio/bind 2>/dev/null || true
+    fi
+}
+
+verify_mezz_bound() {
+    MEZZ="$1"
+    ADC_NODE="$(adc_node_name "${MEZZ}")"
+
+    sleep 0.2
+
+    if [ ! -e "/sys/bus/platform/devices/${ADC_NODE}" ]; then
+        echo "error: ${MEZZ}: platform device ${ADC_NODE} was not created" >&2
+        echo "[recent kernel messages]" >&2
+        dmesg | grep -Ei "adc1283|${ADC_NODE}|pinctrl|gpio|overlay" | tail -60 >&2 || true
+        exit 1
+    fi
+
+    if [ ! -e "/sys/bus/platform/drivers/adc1283-gpio/${ADC_NODE}" ]; then
+        echo "error: ${MEZZ}: platform device ${ADC_NODE} exists but is not bound" >&2
+        echo "[recent kernel messages]" >&2
+        dmesg | grep -Ei "adc1283|${ADC_NODE}|pinctrl|gpio|overlay" | tail -60 >&2 || true
+        exit 1
+    fi
+}
+
+strip_overlay_symbols() {
+    DTBO_FILE="$1"
+
+    if command -v fdtdel >/dev/null 2>&1; then
+        fdtdel "${DTBO_FILE}" /__symbols__ 2>/dev/null || true
+        return 0
+    fi
+
+    if command -v fdtput >/dev/null 2>&1; then
+        fdtput -r "${DTBO_FILE}" /__symbols__ 2>/dev/null || true
+        return 0
+    fi
+
+    echo "warning: neither fdtdel nor fdtput found; /__symbols__ cannot be stripped" >&2
+}
+
 apply_mezz_overlay() {
     MEZZ="$1"
     OVERLAY_NAME="$(mezz_overlay_name "${MEZZ}")"
     OVERLAY_DIR="$(mezz_overlay_dir "${MEZZ}")"
     DTS="/tmp/${OVERLAY_NAME}.dtso"
     DTBO="/tmp/${OVERLAY_NAME}.dtbo"
+    ADC_NODE="$(adc_node_name "${MEZZ}")"
 
     if [ -d "${OVERLAY_DIR}" ]; then
-        echo "${MEZZ}: already active at ${OVERLAY_DIR}"
-        return 0
+        if platform_device_bound "${ADC_NODE}"; then
+            echo "${MEZZ}: already active at ${OVERLAY_DIR}"
+            return 0
+        fi
+
+        bind_platform_device_if_needed "${ADC_NODE}"
+
+        if platform_device_bound "${ADC_NODE}"; then
+            echo "${MEZZ}: overlay was active and device is now bound"
+            return 0
+        fi
+
+        echo "${MEZZ}: stale overlay directory exists without bound device; removing ${OVERLAY_DIR}"
+        rmdir "${OVERLAY_DIR}" 2>/dev/null || {
+            echo "error: could not remove stale overlay ${OVERLAY_DIR}" >&2
+            echo "       reboot is recommended to clear inconsistent configfs overlay state" >&2
+            exit 1
+        }
     fi
 
     write_mezz_dts "${MEZZ}"
     dtc -@ -I dts -O dtb -o "${DTBO}" "${DTS}"
+    strip_overlay_symbols "${DTBO}"
 
     mkdir "${OVERLAY_DIR}"
     if ! cat "${DTBO}" >"${OVERLAY_DIR}/dtbo"; then
@@ -345,20 +428,30 @@ apply_mezz_overlay() {
     fi
 
     echo "${MEZZ}: loaded ${OVERLAY_NAME}"
+    verify_mezz_bound "${MEZZ}"
 }
 
 remove_mezz_overlay() {
     MEZZ="$1"
     OVERLAY_NAME="$(mezz_overlay_name "${MEZZ}")"
     OVERLAY_DIR="$(mezz_overlay_dir "${MEZZ}")"
+    ADC_NODE="$(adc_node_name "${MEZZ}")"
 
-    if [ ! -d "${OVERLAY_DIR}" ]; then
+    if [ -d "${OVERLAY_DIR}" ]; then
+        if rmdir "${OVERLAY_DIR}"; then
+            echo "${MEZZ}: removed ${OVERLAY_NAME}"
+        else
+            echo "warning: ${MEZZ}: could not remove ${OVERLAY_DIR}" >&2
+            echo "         attempting driver unbind fallback" >&2
+        fi
+    else
         echo "${MEZZ}: overlay not active: ${OVERLAY_DIR}"
-        return 0
     fi
 
-    rmdir "${OVERLAY_DIR}"
-    echo "${MEZZ}: removed ${OVERLAY_NAME}"
+    if [ -e "/sys/bus/platform/drivers/adc1283-gpio/${ADC_NODE}" ]; then
+        echo "${MEZZ}: device still bound; unbinding ${ADC_NODE}"
+        echo "${ADC_NODE}" > /sys/bus/platform/drivers/adc1283-gpio/unbind 2>/dev/null || true
+    fi
 }
 
 any_mezz_overlay_active() {
@@ -377,8 +470,9 @@ remove_base_if_unused() {
     fi
 
     if [ -d "${BASE_OVERLAY_DIR}" ]; then
-        rmdir "${BASE_OVERLAY_DIR}"
-        echo "removed base overlay ${BASE_OVERLAY_NAME}"
+        rmdir "${BASE_OVERLAY_DIR}" 2>/dev/null && \
+            echo "removed base overlay ${BASE_OVERLAY_NAME}" || \
+            echo "warning: could not remove base overlay ${BASE_OVERLAY_NAME}" >&2
     fi
 }
 
@@ -389,6 +483,42 @@ list_adc1283_iio_devices() {
         if [ "$(cat "${dev}/name" 2>/dev/null)" = "adc1283-gpio" ]; then
             echo "${dev}"
         fi
+    done
+}
+
+show_real_mezz_state() {
+    echo
+    echo "[selected mezz overlays and binding]"
+
+    for MEZZ in ${MEZZ_LIST}; do
+        OVERLAY_DIR="$(mezz_overlay_dir "${MEZZ}")"
+        ADC_NODE="$(adc_node_name "${MEZZ}")"
+
+        if [ -d "${OVERLAY_DIR}" ]; then
+            overlay_state="active"
+        else
+            overlay_state="inactive"
+        fi
+
+        if [ -e "/sys/firmware/devicetree/base/${ADC_NODE}" ]; then
+            dt_state="present"
+        else
+            dt_state="missing"
+        fi
+
+        if [ -e "/sys/bus/platform/devices/${ADC_NODE}" ]; then
+            platform_state="present"
+        else
+            platform_state="missing"
+        fi
+
+        if [ -e "/sys/bus/platform/drivers/adc1283-gpio/${ADC_NODE}" ]; then
+            bound_state="bound"
+        else
+            bound_state="unbound"
+        fi
+
+        echo "${MEZZ}: overlay=${overlay_state} dt=${dt_state} platform=${platform_state} driver=${bound_state}"
     done
 }
 
@@ -426,16 +556,7 @@ status_selected() {
         echo "base_overlay_active=False"
     fi
 
-    echo
-    echo "[selected mezz overlays]"
-    for MEZZ in ${MEZZ_LIST}; do
-        OVERLAY_DIR="$(mezz_overlay_dir "${MEZZ}")"
-        if [ -d "${OVERLAY_DIR}" ]; then
-            echo "${MEZZ}=active (${OVERLAY_DIR})"
-        else
-            echo "${MEZZ}=inactive (${OVERLAY_DIR})"
-        fi
-    done
+    show_real_mezz_state
 
     echo
     echo "[driver]"
@@ -444,6 +565,14 @@ status_selected() {
     else
         echo "adc1283-gpio=<missing>"
     fi
+
+    echo
+    echo "[all adc1283 platform devices]"
+    ls -1 /sys/bus/platform/devices 2>/dev/null | grep '^adc1283_mezz' || echo "<none>"
+
+    echo
+    echo "[bound adc1283 platform devices]"
+    ls -1 /sys/bus/platform/drivers/adc1283-gpio 2>/dev/null | grep '^adc1283_mezz' || echo "<none>"
 
     echo
     echo "[iio adc1283 devices]"
@@ -488,7 +617,7 @@ status_selected() {
 
     echo
     echo "[recent adc1283 dmesg]"
-    dmesg | grep -i "adc1283" | tail -20 || true
+    dmesg | grep -i "adc1283" | tail -30 || true
 }
 
 MEZZ_LIST="$(normalize_mezz_list "$@")"

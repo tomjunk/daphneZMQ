@@ -307,8 +307,21 @@ static int adc1283_read_channel(struct adc1283_gpio *adc,
 	 *
 	 * raw[31:16] = first word, normally discarded
 	 * raw[15:0]  = selected-channel word = 0000 DB11..DB0
+	 *
+	 * Validate the upper nibble of the selected 16-bit word.
+	 * For a valid ADC1283 frame, bits [15:12] must be zero.
 	 */
-	*value = raw & ADC1283_RESULT_MASK;
+	word = raw & 0xffff;
+	prefix = word >> 12;
+
+	if (prefix != 0) {
+		dev_warn_ratelimited(adc->dev,
+				     "invalid ADC1283 frame: raw=0x%08x word=0x%04x prefix=0x%x\n",
+				     raw, word, prefix);
+		return -EIO;
+	}
+
+	*value = word & ADC1283_RESULT_MASK;
 
 	return 0;
 }
