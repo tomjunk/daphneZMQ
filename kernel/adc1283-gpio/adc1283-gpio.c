@@ -85,6 +85,27 @@ struct adc1283_gpio {
 	int vref_uv;
 };
 
+static void adc1283_prime_gpio_path(struct adc1283_gpio *adc)
+{
+	/*
+	 * Prime the GPIO set/get paths while CS is inactive.
+	 *
+	 * CS is inactive here, so the ADC1283 ignores SCLK. This dummy pulse
+	 * keeps first-use GPIO/cache overhead out of the real 32-clock frame.
+	 */
+	gpiod_set_value(adc->cs, 0);
+
+	gpiod_set_raw_value(adc->din, 0);
+	gpiod_set_raw_value(adc->sclk, 1);
+
+	gpiod_set_raw_value(adc->sclk, 0);
+	gpiod_get_raw_value(adc->dout);
+	gpiod_set_raw_value(adc->sclk, 1);
+
+	gpiod_set_raw_value(adc->din, 0);
+}
+
+
 static void adc1283_delay_ns(u32 nsecs)
 {
 	u32 usecs;
@@ -522,26 +543,6 @@ static int adc1283_probe(struct platform_device *pdev)
 		 adc->disable_irqs);
 
 	return 0;
-}
-
-static void adc1283_prime_gpio_path(struct adc1283_gpio *adc)
-{
-	/*
-	 * Prime the GPIO set/get paths while CS is inactive.
-	 *
-	 * CS is inactive here, so the ADC1283 ignores SCLK. This dummy pulse
-	 * keeps first-use GPIO/cache overhead out of the real 32-clock frame.
-	 */
-	gpiod_set_value(adc->cs, 0);
-
-	gpiod_set_raw_value(adc->din, 0);
-	gpiod_set_raw_value(adc->sclk, 1);
-
-	gpiod_set_raw_value(adc->sclk, 0);
-	gpiod_get_raw_value(adc->dout);
-	gpiod_set_raw_value(adc->sclk, 1);
-
-	gpiod_set_raw_value(adc->din, 0);
 }
 
 static const struct of_device_id adc1283_of_match[] = {
