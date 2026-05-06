@@ -28,9 +28,21 @@ DTBO="${DTBO:-/tmp/${OVERLAY_NAME}.dtbo}"
 TARGET_SCLK_HZ="${TARGET_SCLK_HZ:-800000}"
 CS_SETUP_DELAY_NS="${CS_SETUP_DELAY_NS:-100}"
 CS_HOLD_DELAY_NS="${CS_HOLD_DELAY_NS:-100}"
-DOUT_SAMPLE_DELAY_NS="${DOUT_SAMPLE_DELAY_NS:-250}"
-SCLK_LOW_TAIL_DELAY_NS="${SCLK_LOW_TAIL_DELAY_NS:-150}"
+
+# DOUT sample point after SCLK falling edge.
+# This is inside the low phase, not an extra low delay.
+DOUT_SAMPLE_DELAY_NS="${DOUT_SAMPLE_DELAY_NS:-150}"
+
+# Total programmed low-phase delay budget.
+# The driver waits:
+#   DOUT_SAMPLE_DELAY_NS
+#   read DOUT
+#   SCLK_LOW_DELAY_NS - DOUT_SAMPLE_DELAY_NS
+SCLK_LOW_DELAY_NS="${SCLK_LOW_DELAY_NS:-350}"
+
+# Programmed high-phase delay budget.
 SCLK_HIGH_DELAY_NS="${SCLK_HIGH_DELAY_NS:-350}"
+
 VREF_UV="${VREF_UV:-3300000}"
 
 PINCTRL_DEBUG="/sys/kernel/debug/pinctrl/firmware:zynqmp-firmware:pinctrl-zynqmp_pinctrl/pinmux-pins"
