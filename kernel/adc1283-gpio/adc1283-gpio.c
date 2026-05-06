@@ -161,6 +161,8 @@ static int adc1283_read_channel(struct adc1283_gpio *adc,
 	u8 cmd;
 	u32 raw = 0;
 	int i;
+	u16 word;
+	u16 prefix;
 
 	if (channel >= ADC1283_NUM_CHANNELS)
 		return -EINVAL;
