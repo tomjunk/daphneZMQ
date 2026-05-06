@@ -166,8 +166,15 @@ static int adc1283_read_channel(struct adc1283_gpio *adc,
 	 * Enter the transaction from the required idle state:
 	 * SCLK high, DIN low, CS inactive.
 	 */
+	gpiod_set_value(adc->cs, 0);
 	gpiod_set_raw_value(adc->sclk, 1);
 	gpiod_set_raw_value(adc->din, 0);
+
+	/*
+     * Warm up GPIO paths before the real frame.
+     * This dummy SCLK pulse occurs with CS inactive.
+     */
+    adc1283_prime_gpio_path(adc);
 
 	if (adc->disable_preempt)
 		preempt_disable();
@@ -515,6 +522,26 @@ static int adc1283_probe(struct platform_device *pdev)
 		 adc->disable_irqs);
 
 	return 0;
+}
+
+static void adc1283_prime_gpio_path(struct adc1283_gpio *adc)
+{
+	/*
+	 * Prime the GPIO set/get paths while CS is inactive.
+	 *
+	 * CS is inactive here, so the ADC1283 ignores SCLK. This dummy pulse
+	 * keeps first-use GPIO/cache overhead out of the real 32-clock frame.
+	 */
+	gpiod_set_value(adc->cs, 0);
+
+	gpiod_set_raw_value(adc->din, 0);
+	gpiod_set_raw_value(adc->sclk, 1);
+
+	gpiod_set_raw_value(adc->sclk, 0);
+	gpiod_get_raw_value(adc->dout);
+	gpiod_set_raw_value(adc->sclk, 1);
+
+	gpiod_set_raw_value(adc->din, 0);
 }
 
 static const struct of_device_id adc1283_of_match[] = {
