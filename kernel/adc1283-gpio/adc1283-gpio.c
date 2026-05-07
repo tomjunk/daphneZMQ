@@ -12,6 +12,7 @@
 #include <linux/err.h>
 #include <linux/gpio/consumer.h>
 #include <linux/iio/iio.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -37,14 +38,40 @@
  * These values are delay-loop values, not physical pin durations. The real
  * waveform also includes GPIO write/read overhead and residual kernel jitter.
  *
- * The defaults below intentionally start below 625 ns because GPIO operations
- * add extra time. Tune with an oscilloscope.
+ * Current scope-validated starting point:
+ *
+ *   cs_setup_delay_ns     = 20 ns
+ *   cs_hold_delay_ns      = 100 ns
+ *   dout_sample_delay_ns  = 100 ns
+ *   sclk_low_delay_ns     = 100 ns
+ *   sclk_high_delay_ns    = 360 ns
+ *
+ * The measured MEZ0 waveform was approximately:
+ *
+ *   SCLK high = 685 ns
+ *   SCLK low  = 564 ns
+ *   period    = 1249 ns
+ *   frequency = 800.6 kHz
  */
-#define ADC1283_DEFAULT_CS_SETUP_NS		100
+#define ADC1283_DEFAULT_CS_SETUP_NS		20
 #define ADC1283_DEFAULT_CS_HOLD_NS		100
-#define ADC1283_DEFAULT_DOUT_SAMPLE_NS		150
-#define ADC1283_DEFAULT_LOW_NS			350
-#define ADC1283_DEFAULT_HIGH_NS			350
+#define ADC1283_DEFAULT_DOUT_SAMPLE_NS		100
+#define ADC1283_DEFAULT_LOW_NS			100
+#define ADC1283_DEFAULT_HIGH_NS			360
+
+/*
+ * Dummy SCLK cycles generated while CS is inactive.
+ *
+ * This makes SCLK already active before CS falls and also primes the GPIO path,
+ * avoiding the previously observed first-cycle anomaly.
+ */
+#define ADC1283_DEFAULT_PRECLOCK_CYCLES		2
+
+/*
+ * DIN hold time after SCLK rising edge. This is an offset inside the high
+ * phase, not an extra full high-phase delay.
+ */
+#define ADC1283_DEFAULT_DIN_HOLD_NS		20
 
 struct adc1283_gpio {
 	struct device *dev;
@@ -60,23 +87,27 @@ struct adc1283_gpio {
 	u32 cs_hold_delay_ns;
 
 	/*
-	 * dout_sample_delay_ns is the sampling offset after SCLK falling edge.
-	 * It is not an additional full low-phase delay.
+	 * DOUT sample offset after SCLK falling edge.
+	 * This is inside the low phase.
 	 */
 	u32 dout_sample_delay_ns;
 
 	/*
-	 * sclk_low_delay_ns is the intended low-phase delay budget.
-	 * The driver subtracts dout_sample_delay_ns and only waits the
-	 * remaining low time after sampling DOUT.
+	 * Total programmed low-phase delay budget.
+	 * The driver waits to the DOUT sample point, reads DOUT, then waits
+	 * the remaining low-phase delay.
 	 */
 	u32 sclk_low_delay_ns;
 
 	/*
-	 * sclk_high_delay_ns is the intended high-phase delay budget.
-	 * DIN is updated during the high phase before the next falling edge.
+	 * Total programmed high-phase delay budget.
+	 * The driver waits a DIN-hold offset after SCLK rising, changes DIN
+	 * for the next bit, then waits the remaining high-phase delay.
 	 */
 	u32 sclk_high_delay_ns;
+
+	u32 preclock_cycles;
+	u32 din_hold_delay_ns;
 
 	bool disable_preempt;
 	bool disable_irqs;
@@ -84,27 +115,6 @@ struct adc1283_gpio {
 	struct regulator *vref;
 	int vref_uv;
 };
-
-static void adc1283_prime_gpio_path(struct adc1283_gpio *adc)
-{
-	/*
-	 * Prime the GPIO set/get paths while CS is inactive.
-	 *
-	 * CS is inactive here, so the ADC1283 ignores SCLK. This dummy pulse
-	 * keeps first-use GPIO/cache overhead out of the real 32-clock frame.
-	 */
-	gpiod_set_value(adc->cs, 0);
-
-	gpiod_set_raw_value(adc->din, 0);
-	gpiod_set_raw_value(adc->sclk, 1);
-
-	gpiod_set_raw_value(adc->sclk, 0);
-	gpiod_get_raw_value(adc->dout);
-	gpiod_set_raw_value(adc->sclk, 1);
-
-	gpiod_set_raw_value(adc->din, 0);
-}
-
 
 static void adc1283_delay_ns(u32 nsecs)
 {
@@ -122,6 +132,18 @@ static void adc1283_delay_ns(u32 nsecs)
 
 	if (rem_ns)
 		ndelay(rem_ns);
+}
+
+static void adc1283_delay_clamped(u32 nsecs, u32 max_nsecs,
+				  u32 *remaining_nsecs)
+{
+	if (nsecs >= max_nsecs) {
+		adc1283_delay_ns(max_nsecs);
+		*remaining_nsecs = 0;
+	} else {
+		adc1283_delay_ns(nsecs);
+		*remaining_nsecs = max_nsecs - nsecs;
+	}
 }
 
 static int adc1283_require_fast_gpio(struct device *dev,
@@ -148,9 +170,62 @@ static void adc1283_idle_bus(struct adc1283_gpio *adc)
 	 *   gpiod_set_value(cs, 0) -> CS inactive, physical high
 	 *   gpiod_set_value(cs, 1) -> CS active,   physical low
 	 */
+	gpiod_set_value(adc->cs, 0);
 	gpiod_set_raw_value(adc->sclk, 1);
 	gpiod_set_raw_value(adc->din, 0);
+}
+
+static bool adc1283_din_bit(u8 cmd, int bit)
+{
+	if (bit < ADC1283_CMD_BITS)
+		return !!(cmd & BIT(7 - bit));
+
+	return false;
+}
+
+static void adc1283_preclock_gpio_path(struct adc1283_gpio *adc)
+{
+	u32 low_tail_ns;
+	unsigned int n;
+	int dummy;
+
+	/*
+	 * Preclock with CS inactive.
+	 *
+	 * This produces real SCLK activity before CS falls. The ADC1283 ignores
+	 * these cycles because CS is inactive, but the GPIO set/get paths and
+	 * SCLK timing are already warmed up before the real frame starts.
+	 */
 	gpiod_set_value(adc->cs, 0);
+	gpiod_set_raw_value(adc->din, 0);
+	gpiod_set_raw_value(adc->sclk, 1);
+
+	for (n = 0; n < adc->preclock_cycles; n++) {
+		/*
+		 * Keep the same high/low structure as the real bit loop.
+		 */
+		adc1283_delay_ns(adc->sclk_high_delay_ns);
+
+		gpiod_set_raw_value(adc->sclk, 0);
+
+		adc1283_delay_clamped(adc->dout_sample_delay_ns,
+				      adc->sclk_low_delay_ns,
+				      &low_tail_ns);
+
+		dummy = gpiod_get_raw_value(adc->dout);
+		(void)dummy;
+
+		adc1283_delay_ns(low_tail_ns);
+
+		gpiod_set_raw_value(adc->sclk, 1);
+	}
+
+	/*
+	 * Leave the bus in the required idle state for the real frame:
+	 * SCLK high, DIN low, CS inactive.
+	 */
+	gpiod_set_raw_value(adc->sclk, 1);
+	gpiod_set_raw_value(adc->din, 0);
 }
 
 static int adc1283_read_channel(struct adc1283_gpio *adc,
@@ -160,9 +235,9 @@ static int adc1283_read_channel(struct adc1283_gpio *adc,
 	unsigned long flags = 0;
 	u8 cmd;
 	u32 raw = 0;
-	int i;
 	u16 word;
 	u16 prefix;
+	int i;
 
 	if (channel >= ADC1283_NUM_CHANNELS)
 		return -EINVAL;
@@ -186,18 +261,14 @@ static int adc1283_read_channel(struct adc1283_gpio *adc,
 	mutex_lock(&adc->lock);
 
 	/*
-	 * Enter the transaction from the required idle state:
-	 * SCLK high, DIN low, CS inactive.
+	 * Enter from idle:
+	 *   SCLK high
+	 *   DIN low
+	 *   CS inactive
 	 */
 	gpiod_set_value(adc->cs, 0);
 	gpiod_set_raw_value(adc->sclk, 1);
 	gpiod_set_raw_value(adc->din, 0);
-
-	/*
-     * Warm up GPIO paths before the real frame.
-     * This dummy SCLK pulse occurs with CS inactive.
-     */
-    adc1283_prime_gpio_path(adc);
 
 	if (adc->disable_preempt)
 		preempt_disable();
@@ -206,85 +277,91 @@ static int adc1283_read_channel(struct adc1283_gpio *adc,
 		local_irq_save(flags);
 
 	/*
-	 * CS falling edge starts the conversion.
+	 * Run dummy SCLK cycles while CS is inactive.
+	 *
+	 * This solves two problems:
+	 *   1. It primes the GPIO path before the real frame.
+	 *   2. It makes SCLK already active before CS goes low.
+	 */
+	adc1283_preclock_gpio_path(adc);
+
+	/*
+	 * Prepare DIN bit 0 while CS is still inactive and SCLK is high.
+	 * This gives maximum setup margin for the first real rising edge.
+	 */
+	gpiod_set_raw_value(adc->din, adc1283_din_bit(cmd, 0));
+
+	/*
+	 * Complete a normal SCLK high phase before asserting CS. This makes
+	 * the first real falling edge occur shortly after CS falling instead
+	 * of waiting a full high-delay after CS is already active.
+	 */
+	adc1283_delay_ns(adc->sclk_high_delay_ns);
+
+	/*
+	 * CS falling edge starts the ADC1283 frame. SCLK is high here.
+	 *
+	 * After this short delay, SCLK falls immediately. The following low
+	 * phase gives much more than the ADC1283 CS setup requirement before
+	 * the next SCLK rising edge.
 	 */
 	gpiod_set_value(adc->cs, 1);
 	adc1283_delay_ns(adc->cs_setup_delay_ns);
 
 	for (i = 0; i < ADC1283_NUM_CLOCKS; i++) {
-		bool din_bit;
 		u32 low_tail_ns;
+		u32 high_tail_ns;
 		int dout_bit;
-
-		/*
-		 * At this point SCLK is high.
-		 *
-		 * First keep SCLK high for the configured high delay. This also
-		 * guarantees DIN hold time after the previous rising edge before
-		 * DIN is changed for the next bit.
-		 */
-		adc1283_delay_ns(adc->sclk_high_delay_ns);
-
-		/*
-		 * Update DIN while SCLK is still high.
-		 *
-		 * This prevents the DIN GPIO write from stretching the SCLK low
-		 * phase. DIN will remain stable throughout the upcoming low
-		 * phase and will be latched by the next SCLK rising edge.
-		 */
-		if (i < ADC1283_CMD_BITS)
-			din_bit = !!(cmd & BIT(7 - i));
-		else
-			din_bit = false;
-
-		gpiod_set_raw_value(adc->din, din_bit);
 
 		/*
 		 * Falling edge.
 		 *
-		 * ADC1283 DOUT becomes valid after the falling edge. The first
-		 * edge after CS assertion is therefore falling, because SCLK
-		 * idles high.
+		 * For i == 0, this occurs shortly after CS assertion because
+		 * the SCLK high phase was already completed while CS was still
+		 * inactive.
 		 */
 		gpiod_set_raw_value(adc->sclk, 0);
 
 		/*
-		 * Wait until the configured sample point inside the low phase.
-		 *
-		 * If the sample point is configured beyond the low delay budget,
-		 * clamp it to the low delay. This avoids unsigned underflow in
-		 * the low-tail calculation.
+		 * Sample DOUT at a programmable offset inside the low phase.
 		 */
-		if (adc->dout_sample_delay_ns >= adc->sclk_low_delay_ns) {
-			adc1283_delay_ns(adc->sclk_low_delay_ns);
-			low_tail_ns = 0;
-		} else {
-			adc1283_delay_ns(adc->dout_sample_delay_ns);
-			low_tail_ns = adc->sclk_low_delay_ns -
-				      adc->dout_sample_delay_ns;
-		}
+		adc1283_delay_clamped(adc->dout_sample_delay_ns,
+				      adc->sclk_low_delay_ns,
+				      &low_tail_ns);
 
-		/*
-		 * Sample DOUT during SCLK low.
-		 *
-		 * Reading every cycle keeps the operation count constant across
-		 * all 32 cycles, even though only the second 16-bit word is used.
-		 */
 		dout_bit = gpiod_get_raw_value(adc->dout);
 		raw = (raw << 1) | !!dout_bit;
 
-		/*
-		 * Complete the remaining low phase. This is only the remainder
-		 * after the DOUT sample point, not a second full low delay.
-		 */
 		adc1283_delay_ns(low_tail_ns);
 
 		/*
-		 * Rising edge.
-		 *
-		 * ADC1283 latches DIN here.
+		 * Rising edge. ADC1283 latches DIN here.
 		 */
 		gpiod_set_raw_value(adc->sclk, 1);
+
+		/*
+		 * Do not prepare another bit after the final rising edge.
+		 * Hold CS active for cs_hold_delay_ns, then deassert.
+		 */
+		if (i == ADC1283_NUM_CLOCKS - 1)
+			break;
+
+		/*
+		 * Hold DIN after the SCLK rising edge, then change DIN for the
+		 * next bit. The hold delay is an offset inside the SCLK high
+		 * phase, not an extra full delay.
+		 */
+		adc1283_delay_clamped(adc->din_hold_delay_ns,
+				      adc->sclk_high_delay_ns,
+				      &high_tail_ns);
+
+		gpiod_set_raw_value(adc->din, adc1283_din_bit(cmd, i + 1));
+
+		/*
+		 * Complete the remaining SCLK high phase before the next
+		 * falling edge.
+		 */
+		adc1283_delay_ns(high_tail_ns);
 	}
 
 	/*
@@ -310,8 +387,8 @@ static int adc1283_read_channel(struct adc1283_gpio *adc,
 	 * raw[31:16] = first word, normally discarded
 	 * raw[15:0]  = selected-channel word = 0000 DB11..DB0
 	 *
-	 * Validate the upper nibble of the selected 16-bit word.
-	 * For a valid ADC1283 frame, bits [15:12] must be zero.
+	 * Validate the upper nibble of the selected 16-bit word. For a valid
+	 * ADC1283 frame, bits [15:12] must be zero.
 	 */
 	word = raw & 0xffff;
 	prefix = word >> 12;
@@ -372,7 +449,7 @@ static int adc1283_read_raw(struct iio_dev *indio_dev,
 		/*
 		 * ADC1283 uses AVCC as reference.
 		 * Scale = Vref / 2^12.
-		 * IIO voltage scale is normally reported in millivolts.
+		 * IIO voltage scale is reported in millivolts.
 		 */
 		*val = adc->vref_uv / 1000;
 		*val2 = ADC1283_RESOLUTION_BITS;
@@ -404,6 +481,8 @@ static void adc1283_read_timing_properties(struct adc1283_gpio *adc)
 	adc->dout_sample_delay_ns = ADC1283_DEFAULT_DOUT_SAMPLE_NS;
 	adc->sclk_low_delay_ns = ADC1283_DEFAULT_LOW_NS;
 	adc->sclk_high_delay_ns = ADC1283_DEFAULT_HIGH_NS;
+	adc->preclock_cycles = ADC1283_DEFAULT_PRECLOCK_CYCLES;
+	adc->din_hold_delay_ns = ADC1283_DEFAULT_DIN_HOLD_NS;
 
 	device_property_read_u32(dev, "daphne,cs-setup-delay-ns",
 				 &adc->cs_setup_delay_ns);
@@ -413,7 +492,7 @@ static void adc1283_read_timing_properties(struct adc1283_gpio *adc)
 				 &adc->dout_sample_delay_ns);
 
 	/*
-	 * New property name. This is the total low-phase delay budget.
+	 * Current property name. This is the total low-phase delay budget.
 	 */
 	device_property_read_u32(dev, "daphne,sclk-low-delay-ns",
 				 &adc->sclk_low_delay_ns);
@@ -421,15 +500,18 @@ static void adc1283_read_timing_properties(struct adc1283_gpio *adc)
 	/*
 	 * Backward compatibility with the previous overlay property.
 	 *
-	 * Note: old "low-tail" semantics were different. If this property is
-	 * still used, treat it as the new total low delay to avoid double
-	 * counting sample delay + tail delay.
+	 * Old "low-tail" semantics were different. If this property is still
+	 * used, treat it as the new total low delay to avoid double counting.
 	 */
 	device_property_read_u32(dev, "daphne,sclk-low-tail-delay-ns",
 				 &adc->sclk_low_delay_ns);
 
 	device_property_read_u32(dev, "daphne,sclk-high-delay-ns",
 				 &adc->sclk_high_delay_ns);
+	device_property_read_u32(dev, "daphne,preclock-cycles",
+				 &adc->preclock_cycles);
+	device_property_read_u32(dev, "daphne,din-hold-delay-ns",
+				 &adc->din_hold_delay_ns);
 
 	adc->disable_preempt =
 		device_property_read_bool(dev, "daphne,disable-preempt");
@@ -441,6 +523,12 @@ static void adc1283_read_timing_properties(struct adc1283_gpio *adc)
 			 "dout_sample_delay_ns=%u exceeds sclk_low_delay_ns=%u; sample point will be clamped\n",
 			 adc->dout_sample_delay_ns,
 			 adc->sclk_low_delay_ns);
+
+	if (adc->din_hold_delay_ns > adc->sclk_high_delay_ns)
+		dev_warn(dev,
+			 "din_hold_delay_ns=%u exceeds sclk_high_delay_ns=%u; DIN update point will be clamped\n",
+			 adc->din_hold_delay_ns,
+			 adc->sclk_high_delay_ns);
 }
 
 static int adc1283_probe(struct platform_device *pdev)
@@ -548,12 +636,14 @@ static int adc1283_probe(struct platform_device *pdev)
 				     "failed to register IIO device\n");
 
 	dev_info(dev,
-		 "ADC1283 GPIO driver active: cs_setup=%u ns cs_hold=%u ns dout_sample=%u ns low=%u ns high=%u ns preempt=%u irqs=%u\n",
+		 "ADC1283 GPIO driver active: cs_setup=%u ns cs_hold=%u ns dout_sample=%u ns low=%u ns high=%u ns din_hold=%u ns preclock=%u preempt=%u irqs=%u\n",
 		 adc->cs_setup_delay_ns,
 		 adc->cs_hold_delay_ns,
 		 adc->dout_sample_delay_ns,
 		 adc->sclk_low_delay_ns,
 		 adc->sclk_high_delay_ns,
+		 adc->din_hold_delay_ns,
+		 adc->preclock_cycles,
 		 adc->disable_preempt,
 		 adc->disable_irqs);
 

@@ -21,6 +21,8 @@
 #   DOUT_SAMPLE_DELAY_NS=100 \
 #   SCLK_LOW_DELAY_NS=100 \
 #   SCLK_HIGH_DELAY_NS=360 \
+#   DIN_HOLD_DELAY_NS=20 \
+#   PRECLOCK_CYCLES=2 \
 #   VREF_UV=3300000 \
 #   sudo -E sh scripts/apply_mezz_adc1283_gpio_overlays.sh apply mezz0 mezz3
 
@@ -46,6 +48,8 @@ CS_HOLD_DELAY_NS="${CS_HOLD_DELAY_NS:-100}"
 DOUT_SAMPLE_DELAY_NS="${DOUT_SAMPLE_DELAY_NS:-100}"
 SCLK_LOW_DELAY_NS="${SCLK_LOW_DELAY_NS:-100}"
 SCLK_HIGH_DELAY_NS="${SCLK_HIGH_DELAY_NS:-360}"
+DIN_HOLD_DELAY_NS="${DIN_HOLD_DELAY_NS:-20}"
+PRECLOCK_CYCLES="${PRECLOCK_CYCLES:-2}"
 VREF_UV="${VREF_UV:-3300000}"
 
 PINCTRL_DEBUG="/sys/kernel/debug/pinctrl/firmware:zynqmp-firmware:pinctrl-zynqmp_pinctrl/pinmux-pins"
@@ -318,6 +322,8 @@ write_mezz_dts() {
                 daphne,dout-sample-delay-ns = <${DOUT_SAMPLE_DELAY_NS}>;
                 daphne,sclk-low-delay-ns = <${SCLK_LOW_DELAY_NS}>;
                 daphne,sclk-high-delay-ns = <${SCLK_HIGH_DELAY_NS}>;
+                daphne,din-hold-delay-ns = <${DIN_HOLD_DELAY_NS}>;
+                daphne,preclock-cycles = <${PRECLOCK_CYCLES}>;
 
                 daphne,disable-preempt;
                 daphne,disable-irqs;
