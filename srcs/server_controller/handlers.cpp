@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -177,10 +178,299 @@ constexpr uint32_t OFF_BSY_LO = 0x0Cu;
 constexpr uint32_t OFF_BSY_HI = 0x10u;
 constexpr uint32_t OFF_FUL_LO = 0x14u;
 constexpr uint32_t OFF_FUL_HI = 0x18u;
-constexpr uint32_t THRESH_MASK = 0x0FFFFFFFu;
+constexpr uint32_t MASK_28BIT = 0x0FFFFFFFu;
 constexpr uint32_t MASK_REG_LOW = 0x94000020u;
 constexpr uint32_t MASK_REG_HIGH = 0x94000024u;
 }  // namespace trigregs
+
+namespace stuffregs {
+constexpr uint32_t PHYS_BASE = 0x94000000u;
+constexpr uint32_t SPAN = 0x100u;
+constexpr uint32_t OFF_ST_CONFIG = 0x2Cu;
+constexpr uint32_t OFF_ST_DELAY = 0x30u;
+constexpr uint32_t OFF_ST_FILTER_OUTPUT_SEL = 0x34u;
+constexpr uint32_t OFF_ST_AFE_COMP_LO = 0x3Cu;
+constexpr uint32_t OFF_ST_AFE_COMP_HI = 0x40u;
+constexpr uint32_t OFF_ST_INVERT_LO = 0x44u;
+constexpr uint32_t OFF_ST_INVERT_HI = 0x48u;
+constexpr uint64_t MASK_40BIT = 0xFFFFFFFFFFULL;
+}  // namespace stuffregs
+
+namespace cmspi {
+constexpr uint64_t DEFAULT_BASE = 0x9C020000ULL;
+constexpr size_t SPAN = 0x100u;
+constexpr uint32_t SRR = 0x40u;
+constexpr uint32_t SPICR = 0x60u;
+constexpr uint32_t SPISR = 0x64u;
+constexpr uint32_t DTR = 0x68u;
+constexpr uint32_t DRR = 0x6Cu;
+constexpr uint32_t SPISSR = 0x70u;
+
+constexpr uint32_t CR_SPE = 1u << 1;
+constexpr uint32_t CR_MASTER = 1u << 2;
+constexpr uint32_t CR_CPHA = 1u << 4;
+constexpr uint32_t CR_TXFIFO_RESET = 1u << 5;
+constexpr uint32_t CR_RXFIFO_RESET = 1u << 6;
+constexpr uint32_t CR_MANUAL_SS = 1u << 7;
+constexpr uint32_t CR_INHIBIT = 1u << 8;
+constexpr uint32_t SR_RX_EMPTY = 1u << 0;
+
+constexpr uint8_t ADS_RESET = 0x06u;
+constexpr uint8_t ADS_START = 0x08u;
+constexpr uint8_t ADS_STOP = 0x0Au;
+constexpr uint8_t ADS_RDATA = 0x12u;
+constexpr uint8_t ADS_RREG = 0x20u;
+constexpr uint8_t ADS_WREG = 0x40u;
+constexpr uint8_t REG_ID = 0x00u;
+constexpr uint8_t REG_STATUS = 0x01u;
+constexpr uint8_t REG_MODE0 = 0x02u;
+constexpr uint8_t REG_MODE3 = 0x05u;
+constexpr uint8_t REG_PGA = 0x10u;
+constexpr uint8_t REG_INPMUX = 0x11u;
+}  // namespace cmspi
+
+uint64_t env_u64(const char* name, uint64_t fallback) {
+  const char* text = std::getenv(name);
+  if (text == nullptr || *text == '\0') return fallback;
+
+  errno = 0;
+  char* end = nullptr;
+  const uint64_t value = std::strtoull(text, &end, 0);
+  if (errno != 0 || end == text || (end != nullptr && *end != '\0')) return fallback;
+  return value;
+}
+
+uint32_t lower32(uint64_t value) {
+  return static_cast<uint32_t>(value & 0xFFFFFFFFULL);
+}
+
+uint32_t upper40(uint64_t value) {
+  return static_cast<uint32_t>((value >> 32) & 0xFFULL);
+}
+
+std::string hex_u64(uint64_t value, int width = 0) {
+  std::ostringstream os;
+  os << "0x" << std::hex << std::uppercase;
+  if (width > 0) os << std::setw(width) << std::setfill('0');
+  os << value << std::dec;
+  return os.str();
+}
+
+class AxiQuadSpi {
+ public:
+  explicit AxiQuadSpi(uint64_t base) : mem_(base) {
+    mem_.map_memory(cmspi::SPAN);
+    reset_core();
+  }
+
+  std::vector<uint8_t> transfer(const std::vector<uint8_t>& tx) {
+    if (tx.empty()) return {};
+
+    const uint32_t idle_cr = base_cr_ | cmspi::CR_INHIBIT;
+    mem_.write_u32(cmspi::SPISSR, 0xFFFFFFFFu);
+    mem_.write_u32(cmspi::SPICR, idle_cr | cmspi::CR_TXFIFO_RESET | cmspi::CR_RXFIFO_RESET);
+    mem_.write_u32(cmspi::SPICR, idle_cr);
+
+    drain_rx_fifo();
+    for (const uint8_t b : tx) {
+      mem_.write_u32(cmspi::DTR, b);
+    }
+
+    mem_.write_u32(cmspi::SPISSR, 0xFFFFFFFEu);
+    mem_.write_u32(cmspi::SPICR, base_cr_);
+
+    std::vector<uint8_t> rx;
+    rx.reserve(tx.size());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    while (rx.size() < tx.size()) {
+      const uint32_t status = mem_.read_u32(cmspi::SPISR);
+      if ((status & cmspi::SR_RX_EMPTY) == 0) {
+        rx.push_back(static_cast<uint8_t>(mem_.read_u32(cmspi::DRR) & 0xFFu));
+        continue;
+      }
+      if (std::chrono::steady_clock::now() > deadline) {
+        mem_.write_u32(cmspi::SPICR, idle_cr);
+        mem_.write_u32(cmspi::SPISSR, 0xFFFFFFFFu);
+        throw std::runtime_error("AXI Quad SPI transfer timed out waiting for RX data");
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+
+    mem_.write_u32(cmspi::SPICR, idle_cr);
+    mem_.write_u32(cmspi::SPISSR, 0xFFFFFFFFu);
+    return rx;
+  }
+
+ private:
+  void reset_core() {
+    mem_.write_u32(cmspi::SRR, 0x0Au);
+    std::this_thread::sleep_for(std::chrono::microseconds(10));
+    mem_.write_u32(cmspi::SPISSR, 0xFFFFFFFFu);
+    mem_.write_u32(cmspi::SPICR,
+                   base_cr_ | cmspi::CR_INHIBIT | cmspi::CR_TXFIFO_RESET | cmspi::CR_RXFIFO_RESET);
+    mem_.write_u32(cmspi::SPICR, base_cr_ | cmspi::CR_INHIBIT);
+  }
+
+  void drain_rx_fifo() {
+    for (int i = 0; i < 64; ++i) {
+      const uint32_t status = mem_.read_u32(cmspi::SPISR);
+      if ((status & cmspi::SR_RX_EMPTY) != 0) return;
+      (void)mem_.read_u32(cmspi::DRR);
+    }
+  }
+
+  DevMem mem_;
+  const uint32_t base_cr_ = cmspi::CR_SPE | cmspi::CR_MASTER | cmspi::CR_CPHA | cmspi::CR_MANUAL_SS;
+};
+
+uint8_t ads_command(AxiQuadSpi& spi, uint8_t opcode) {
+  const std::vector<uint8_t> rx = spi.transfer({opcode, 0x00u});
+  return rx.size() > 1 ? rx[1] : 0;
+}
+
+uint8_t ads_read_reg(AxiQuadSpi& spi, uint8_t reg_addr) {
+  const std::vector<uint8_t> rx = spi.transfer({static_cast<uint8_t>(cmspi::ADS_RREG | (reg_addr & 0x1Fu)),
+                                                0x00u,
+                                                0x00u});
+  if (rx.size() < 3) throw std::runtime_error("short ADS126x RREG response");
+  return rx[2];
+}
+
+void ads_write_reg(AxiQuadSpi& spi, uint8_t reg_addr, uint8_t value) {
+  const std::vector<uint8_t> rx = spi.transfer({static_cast<uint8_t>(cmspi::ADS_WREG | (reg_addr & 0x1Fu)), value});
+  if (rx.size() < 2) throw std::runtime_error("short ADS126x WREG response");
+}
+
+uint8_t current_monitor_mux_for_channel(uint32_t channel) {
+  const std::string env_name = "DAPHNE_CURRENT_MONITOR_MUX_" + std::to_string(channel);
+  if (std::getenv(env_name.c_str()) != nullptr) {
+    return static_cast<uint8_t>(env_u64(env_name.c_str(), 0xFFu) & 0xFFu);
+  }
+
+  if (channel > 9) {
+    throw std::invalid_argument("current monitor channel out of range (0..9): " + std::to_string(channel));
+  }
+  const uint8_t muxp = static_cast<uint8_t>(channel + 1u);
+  const uint8_t muxn = static_cast<uint8_t>(env_u64("DAPHNE_CURRENT_MONITOR_NEG_MUX", 0x0u) & 0x0Fu);
+  return static_cast<uint8_t>((muxp << 4) | muxn);
+}
+
+bool read_current_monitor_raw(const cmd_readCurrentMonitor& req,
+                              uint32_t& current_value,
+                              std::string& response_msg) {
+  try {
+    const uint64_t base = env_u64("DAPHNE_CURRENT_MONITOR_SPI_BASE", cmspi::DEFAULT_BASE);
+    const uint32_t channel = req.currentmonitorchannel();
+    const uint8_t mux = current_monitor_mux_for_channel(channel);
+
+    AxiQuadSpi spi(base);
+    (void)ads_command(spi, cmspi::ADS_RESET);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    const uint8_t id = ads_read_reg(spi, cmspi::REG_ID);
+    const uint8_t dev_id = static_cast<uint8_t>((id >> 4) & 0x0Fu);
+    if (dev_id != 0x8u && dev_id != 0xAu) {
+      std::ostringstream os;
+      os << "ADS126x current monitor did not return a valid device id: id=" << hex_u64(id, 2)
+         << " dev_id=" << hex_u64(dev_id, 1);
+      response_msg = os.str();
+      return false;
+    }
+
+    ads_write_reg(spi, cmspi::REG_MODE3, 0x00u);  // Disable STATUS and CRC bytes for fixed-length reads.
+    ads_write_reg(spi, cmspi::REG_MODE0, 0x6Cu);  // 14.4 kSPS, FIR filter, matching the legacy driver intent.
+    ads_write_reg(spi, cmspi::REG_PGA, 0x05u);    // PGA enabled, gain code 5.
+    ads_write_reg(spi, cmspi::REG_INPMUX, mux);
+
+    const uint8_t mux_readback = ads_read_reg(spi, cmspi::REG_INPMUX);
+    if (mux_readback != mux) {
+      std::ostringstream os;
+      os << "ADS126x INPMUX write/readback mismatch: wrote=" << hex_u64(mux, 2)
+         << " read=" << hex_u64(mux_readback, 2);
+      response_msg = os.str();
+      return false;
+    }
+
+    (void)ads_command(spi, cmspi::ADS_START);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const std::vector<uint8_t> rx = spi.transfer({cmspi::ADS_RDATA, 0x00u, 0x00u, 0x00u, 0x00u});
+    (void)ads_command(spi, cmspi::ADS_STOP);
+    if (rx.size() < 5) throw std::runtime_error("short ADS126x RDATA response");
+
+    const uint32_t raw24 = (static_cast<uint32_t>(rx[2]) << 16) |
+                           (static_cast<uint32_t>(rx[3]) << 8) |
+                           static_cast<uint32_t>(rx[4]);
+    const int32_t signed_raw = (raw24 & 0x800000u) ? static_cast<int32_t>(raw24 | 0xFF000000u)
+                                                   : static_cast<int32_t>(raw24);
+    current_value = static_cast<uint32_t>(signed_raw);
+
+    const uint8_t status = ads_read_reg(spi, cmspi::REG_STATUS);
+    std::ostringstream os;
+    os << "OK: ADS126x raw 24-bit conversion"
+       << " channel=" << channel
+       << " mux=" << hex_u64(mux, 2)
+       << " id=" << hex_u64(id, 2)
+       << " status=" << hex_u64(status, 2)
+       << " raw24=" << hex_u64(raw24, 6)
+       << " signed=" << signed_raw;
+    response_msg = os.str();
+    return true;
+  } catch (const std::exception& e) {
+    response_msg = std::string("Current monitor read failed: ") + e.what();
+    current_value = 0;
+    return false;
+  }
+}
+
+bool write_self_trigger_controls(const ConfigureRequest& cfg, std::string& response_msg) {
+  std::ostringstream out;
+  bool ok = true;
+
+  try {
+    DevMem stuff(stuffregs::PHYS_BASE);
+    stuff.map_memory(stuffregs::SPAN);
+
+    if (cfg.tp_conf() != 0) {
+      const uint64_t tp_conf = cfg.tp_conf();
+      const uint32_t filter_output_sel = static_cast<uint32_t>(tp_conf & 0x3ULL);
+      const uint32_t st_config = static_cast<uint32_t>((tp_conf >> 2) & 0x3FFFULL);
+      const uint32_t signal_delay = static_cast<uint32_t>((tp_conf >> 16) & 0x1FULL);
+
+      stuff.write_u32(stuffregs::OFF_ST_CONFIG, st_config);
+      stuff.write_u32(stuffregs::OFF_ST_DELAY, signal_delay);
+      stuff.write_u32(stuffregs::OFF_ST_FILTER_OUTPUT_SEL, filter_output_sel);
+
+      out << "tp_conf " << hex_u64(tp_conf, 8)
+          << " -> st_config=" << hex_u64(st_config, 4)
+          << " signal_delay=" << signal_delay
+          << " filter_output_selector=" << filter_output_sel << ".\n";
+    } else {
+      out << "tp_conf is zero; leaving descriptor config/delay/filter selector unchanged.\n";
+    }
+
+    const uint64_t comp = cfg.compensator() & stuffregs::MASK_40BIT;
+    stuff.write_u32(stuffregs::OFF_ST_AFE_COMP_LO, lower32(comp));
+    stuff.write_u32(stuffregs::OFF_ST_AFE_COMP_HI, upper40(comp));
+    out << "compensator mask=" << hex_u64(comp, 10) << ".\n";
+
+    const uint64_t inv = cfg.inverters() & stuffregs::MASK_40BIT;
+    stuff.write_u32(stuffregs::OFF_ST_INVERT_LO, lower32(inv));
+    stuff.write_u32(stuffregs::OFF_ST_INVERT_HI, upper40(inv));
+    out << "inverter mask=" << hex_u64(inv, 10) << ".\n";
+
+    if ((cfg.self_trigger_xcorr() >> 28) != 0) {
+      out << "self_trigger_xcorr discrimination field="
+          << hex_u64((cfg.self_trigger_xcorr() >> 28) & 0x3FFFULL, 4)
+          << " has no separate register in this gateware; threshold_xc uses bits [27:0].\n";
+    }
+  } catch (const std::exception& e) {
+    ok = false;
+    out << "Failed to write self-trigger control registers via /dev/mem: " << e.what() << ".\n";
+  }
+
+  response_msg = out.str();
+  return ok;
+}
 
 bool read_counters_raw(uint32_t base,
                        const std::vector<uint32_t>& chs,
@@ -229,7 +519,7 @@ bool read_counters_raw(uint32_t base,
     const uint32_t b = base + ch * trigregs::STRIDE;
     auto* s = resp.add_snapshots();
     s->set_channel(ch);
-    s->set_threshold(rd32(b + trigregs::OFF_THR) & trigregs::THRESH_MASK);
+    s->set_threshold(rd32(b + trigregs::OFF_THR) & trigregs::MASK_28BIT);
     s->set_record_count(rd64(b + trigregs::OFF_REC_LO, b + trigregs::OFF_REC_HI));
     s->set_busy_count(rd64(b + trigregs::OFF_BSY_LO, b + trigregs::OFF_BSY_HI));
     s->set_full_count(rd64(b + trigregs::OFF_FUL_LO, b + trigregs::OFF_FUL_HI));
@@ -264,13 +554,19 @@ bool write_trigger_thresholds(const ConfigureRequest& cfg, std::string& response
     }
   }
 
-  const uint64_t requested_thr = cfg.self_trigger_threshold();
-  uint32_t thr_val = static_cast<uint32_t>(requested_thr & trigregs::THRESH_MASK);
-  if (requested_thr > static_cast<uint64_t>(trigregs::THRESH_MASK)) {
-    out << "Requested threshold " << requested_thr
-        << " exceeds 28-bit THRESH_S_AXI range; clamping to 0x0FFFFFFF.\n";
-    thr_val = trigregs::THRESH_MASK;
+  const bool use_xcorr_threshold = cfg.self_trigger_xcorr() != 0;
+  const uint64_t raw_threshold = use_xcorr_threshold
+                                     ? (cfg.self_trigger_xcorr() & trigregs::MASK_28BIT)
+                                     : cfg.self_trigger_threshold();
+  uint32_t thr_val = static_cast<uint32_t>(raw_threshold);
+  if (raw_threshold > trigregs::MASK_28BIT) {
+    out << "Requested threshold " << raw_threshold << " exceeds 28-bit range; clamping to "
+        << trigregs::MASK_28BIT << ".\n";
+    thr_val = trigregs::MASK_28BIT;
   }
+  out << "Trigger threshold source: "
+      << (use_xcorr_threshold ? "self_trigger_xcorr[27:0]" : "self_trigger_threshold")
+      << ".\n";
 
   try {
     DevMem thr_mem(trigregs::PHYS_BASE);
@@ -280,8 +576,7 @@ bool write_trigger_thresholds(const ConfigureRequest& cfg, std::string& response
       const size_t off = static_cast<size_t>(ch) * trigregs::STRIDE + trigregs::OFF_THR;
       thr_mem.write(off, std::vector<uint32_t>{thr_val});
     }
-    out << "Trigger threshold_xc 0x" << std::hex << thr_val << std::dec
-        << " written to channels:";
+    out << "Trigger threshold 0x" << std::hex << thr_val << std::dec << " written to channels:";
     for (const auto ch : channels) out << " " << ch;
     out << ".\n";
   } catch (const std::exception& e) {
@@ -424,6 +719,13 @@ bool configureDaphne(const ConfigureRequest& requested_cfg, Daphne& daphne, std:
       const bool thr_ok = write_trigger_thresholds(requested_cfg, thr_msg);
       ok_all = ok_all && thr_ok;
       out << "[TRIGGER_THRESHOLDS]\n" << thr_msg;
+    }
+
+    {
+      std::string st_msg;
+      const bool st_ok = write_self_trigger_controls(requested_cfg, st_msg);
+      ok_all = ok_all && st_ok;
+      out << "[SELF_TRIGGER_CONTROL]\n" << st_msg;
     }
 
     for (const ChannelConfig& ch_config : requested_cfg.channels()) {
@@ -1472,10 +1774,13 @@ std::unordered_map<daphne::MessageTypeV2, V2Handler> make_v2_handlers() {
       return;
     }
 
-    resp.set_success(false);
-    resp.set_message("Current monitor not implemented in firmware drivers");
+    uint32_t current_value = 0;
+    std::string msg;
+    const bool ok = read_current_monitor_raw(req, current_value, msg);
+    resp.set_success(ok);
+    resp.set_message(msg);
     resp.set_currentmonitorchannel(req.currentmonitorchannel());
-    resp.set_currentvalue(0);
+    resp.set_currentvalue(current_value);
     out = serialize_or_empty(resp);
   };
 
