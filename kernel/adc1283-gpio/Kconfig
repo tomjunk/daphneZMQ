@@ -1,0 +1,14 @@
+config ADC1283_GPIO
+	tristate "ADC1283 GPIO bit-banged IIO ADC driver"
+	depends on GPIOLIB
+	depends on IIO
+	help
+	  IIO ADC driver for the ST ADC1283 using DAPHNE mezzanine
+	  PS MIO GPIO pins.
+
+	  This driver is intentionally ADC1283-specific. It does not expose
+	  a generic SPI master or a spidev node. Instead, it implements the
+	  ADC1283 32-clock conversion/read sequence directly and exposes
+	  the eight input channels through the Linux IIO subsystem.
+
+	  The intended DAPHNE target clock is 800 kHz.

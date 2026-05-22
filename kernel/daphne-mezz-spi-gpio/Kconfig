@@ -1,0 +1,7 @@
+config SPI_DAPHNE_MEZZ_GPIO
+	tristate "DAPHNE calibrated mezzanine GPIO SPI master"
+	depends on GPIOLIB
+	help
+	  SPI master driver for the DAPHNE mezzanine PS MIO SPI-style lines.
+	  It exposes normal Linux SPI devices while using calibrated GPIO
+	  timing for lower jitter than the generic spi-gpio driver.
